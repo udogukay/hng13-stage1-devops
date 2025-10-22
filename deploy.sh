@@ -1,106 +1,113 @@
 #!/bin/bash
-#
-#
-#
-# important error handling
+# Automated Docker Deployment Script
+#Error Handling
 set -e
 set -u
 set -o pipefail
-#
+
 LOGFILE="deploy_$(date +%Y%m%d).log"
 exec > >(tee -a "$LOGFILE") 2>&1
 
-trap 'echo "[ERROR] Script failed at line \$LINENO"; exit 1' ERR
+trap 'echo "[ERROR] Script failed at line $LINENO"; exit 1' ERR
 trap 'echo "[INFO] Script interrupted."; exit 2' INT
 
 echo "Deployment started at $(date)"
-#
-#
+
 # User input collection
-read -p "Git Repo URL" REPO_URL
-read -p "Personal Access Token " PAT
-read -p "SSH Username" SSH_UNAME
-read -p "SSH IP Address" SSH_IP
-read -p "SSH Key path" SSH_KEY
-read -p "Internal Container Application Port" APP_PORT
-#
-#
-# Local Workspace prep
-echo "Prepping Local Workspace..."
+read -p "Git Repo URL: " REPO_URL
+read -s -p "Personal Access Token: " PAT; echo
+read -p "SSH Username: " SSH_UNAME
+read -p "SSH IP Address: " SSH_IP
+read -p "SSH Key path [~/.ssh/id_rsa]: " SSH_KEY
+SSH_KEY=${SSH_KEY:-~/.ssh/id_rsa}
+read -p "Internal Container Application Port [8080]: " APP_PORT
+APP_PORT=${APP_PORT:-8080}
+
+# Local workspace setup
+echo "Preparing local workspace..."
 WORKDIR="$PWD/stagingarea"
-REPO=$()
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
+
 REPO=$(basename -s .git "$REPO_URL")
 AUTH_URL="https://${PAT}@${REPO_URL#https://}"
-echo "Cloning Repo..."
+
 if [ -d "$REPO/.git" ]; then
   echo "Repository exists. Pulling latest changes..."
   cd "$REPO"
-  git pull
+  git pull || { echo "Git pull failed"; exit 20; }
 else
   echo "Cloning repository..."
-  git clone "$AUTH_URL"
+  git clone "$AUTH_URL" || { echo "Git clone failed"; exit 20; }
   cd "$REPO"
 fi
-echo "done"
+echo "Repository ready."
 
+# Verify Dockerfile or docker-compose.yml
 if [[ ! -f Dockerfile && ! -f docker-compose.yml ]]; then
-  echo "Error: No Dockerfile or docker-compose.yml found"
-  exit 1
+  echo "Error: No Dockerfile or docker-compose.yml found."
+  exit 30
 else
-    echo "Docker profile detected"
+  echo "Docker build file detected."
 fi
 
-echo "Local Workspace prep complete"
+#Connectivity check
 echo "Checking server connectivity..."
-ping -c 2 "$SSH_HOST" >/dev/null || {
+ping -c 2 "$SSH_IP" >/dev/null || {
   echo "Error: Server not reachable (ping failed)."
-  exit 1
+  exit 40
 }
-echo "connectivity test passed"
-# SSH into remote server and update/ install required appps
-#
-echo "updating remote env, prepping docker and nginx..."
-ssh -i "$SSH_KEY" "$SSH_UNAME@$SSH_IP"
+echo "Ping OK."
 
-<<EOF
+echo "Testing SSH access..."
+ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$SSH_UNAME@$SSH_IP" "echo SSH OK" >/dev/null || {
+  echo "Error: SSH connection failed."
+  exit 40
+}
+echo "SSH OK."
+
+# Remote environment setup
+echo "Setting up remote environment..."
+ssh -i "$SSH_KEY" "$SSH_UNAME@$SSH_IP" <<'EOF'
 sudo apt update -y
 sudo apt install -y docker.io docker-compose nginx
-sudo usermod -aG docker \$USER
-echo "Starting services..."
+sudo usermod -aG docker $USER
 sudo systemctl enable --now docker
 sudo systemctl enable --now nginx
-
 docker --version
 docker-compose --version
 nginx -v
-
 rm -rf ~/app && mkdir ~/app
 EOF
-echo "done"
-echo "Transferring project files via scp..."
+echo "Remote environment ready."
+
+# Transfer project files
+echo "Transferring project files..."
 scp -i "$SSH_KEY" -r ./* "$SSH_UNAME@$SSH_IP:~/app"
-ssh -i "$SSH_KEY" "$SSH_UNAME@$SSH_IP"
-<<EOF
+
+# Deploy Docker container
+ssh -i "$SSH_KEY" "$SSH_UNAME@$SSH_IP" <<EOF
 cd ~/app
 echo "Building Docker image..."
 docker build -t hng1 .
 
+echo "Stopping old container..."
 docker rm -f hng1_container 2>/dev/null || true
 
 echo "Running new container..."
-docker run -d --name hng1_container -p 127.0.0.1:$APP_PORT:$APP_PORT app_image
+docker run -d --name hng1_container -p 127.0.0.1:$APP_PORT:$APP_PORT hng1
 
 echo "Checking container health..."
 docker ps --filter "name=hng1_container"
 docker logs --tail 10 hng1_container
 
-echo "Testing app accessibility..."
+echo "Testing container access..."
 curl -I http://127.0.0.1:$APP_PORT | head -n 1
 EOF
-echo "Configuring Nginx as reverse proxy..."
-ssh -i "$SSH_KEY" "$SSH_UNAME@$SSH_HOST" <<EOF
+
+# Configure Nginx reverse proxy
+echo "Configuring Nginx..."
+ssh -i "$SSH_KEY" "$SSH_UNAME@$SSH_IP" <<EOF
 sudo bash -c 'cat > /etc/nginx/sites-available/app.conf <<NGINXCONF
 server {
     listen 80;
@@ -115,29 +122,28 @@ server {
 NGINXCONF'
 
 sudo ln -sf /etc/nginx/sites-available/app.conf /etc/nginx/sites-enabled/app.conf
-
-echo "Testing Nginx configuration..."
 sudo nginx -t
-
-echo "Reloading Nginx..."
 sudo systemctl reload nginx
 EOF
 
+# Validate deployment
 echo "Validating deployment..."
-ssh -i "$SSH_KEY" "$SSH_UNAME@$SSH_HOST" <<EOF
+ssh -i "$SSH_KEY" "$SSH_UNAME@$SSH_IP" <<EOF
 echo "Checking Docker service..."
 sudo systemctl is-active --quiet docker && echo "Docker is running."
 
-echo "Checking container status..."
-docker ps --filter "name=app_container"
+echo "Checking container..."
+docker ps --filter "name=hng1_container"
 
 echo "Checking Nginx service..."
 sudo systemctl is-active --quiet nginx && echo "Nginx is running."
 
-echo "Testing local proxy access..."
+echo "Testing local proxy..."
 curl -I http://127.0.0.1 | head -n 1
 
-echo "Testing external access (server public IP)..."
-curl -I http://$SSH_HOST | head -n 1
+echo "Testing external proxy..."
+curl -I http://$SSH_IP | head -n 1
 EOF
-echo "Validation complete."
+
+echo "=== Deployment completed successfully at $(date) ==="
+exit 0
