@@ -145,5 +145,5 @@ echo "Testing external proxy..."
 curl -I http://$SSH_IP | head -n 1
 EOF
 
-echo "=== Deployment completed successfully at $(date) ==="
+echo "Deployment completed successfully at $(date)"
 exit 0
